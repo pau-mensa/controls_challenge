@@ -11,7 +11,7 @@ from stable_baselines3.common.vec_env import VecNormalize, VecFrameStack
 import pickle
 
 class BaseController:
-  def update(self, target_lataccel, current_lataccel, state, target_future):
+  def update(self, target_lataccel, current_lataccel, state):
     """
     Args:
       target_lataccel: The target lateral acceleration.
@@ -83,3 +83,10 @@ class RLController(BaseController):
   def update_options(self, options):
     with open('options_dict.pkl', 'wb') as handle:
       pickle.dump(options, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    
+CONTROLLERS = {
+  'open': OpenController,
+  'simple': SimpleController,
+  'rl': RLController,
+}
