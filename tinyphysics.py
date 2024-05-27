@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import numpy as np
 import onnxruntime as ort
 import pandas as pd
@@ -7,18 +8,21 @@ import seaborn as sns
 import signal
 
 from collections import namedtuple
+from functools import partial
 from hashlib import md5
 from pathlib import Path
 from typing import List, Union, Tuple
-from tqdm import tqdm
+from tqdm.contrib.concurrent import process_map
 
-from controllers import BaseController, CONTROLLERS
+from controllers import BaseController
 
 sns.set_theme()
 signal.signal(signal.SIGINT, signal.SIG_DFL)  # Enable Ctrl-C on plot windows
 
 ACC_G = 9.81
+FPS = 10
 CONTROL_START_IDX = 100
+COST_END_IDX = 550
 CONTEXT_LENGTH = 20
 VOCAB_SIZE = 1024
 LATACCEL_RANGE = [-5, 5]
@@ -26,6 +30,8 @@ STEER_RANGE = [-2, 2]
 MAX_ACC_DELTA = 0.5
 DEL_T = 0.1
 LAT_ACCEL_COST_MULTIPLIER = 5.0
+
+FUTURE_PLAN_STEPS = FPS * 5  # 5 secs
 
 State = namedtuple('State', ['roll_lataccel', 'v_ego', 'a_ego'])
 
@@ -53,14 +59,7 @@ class TinyPhysicsModel:
     options.intra_op_num_threads = 1
     options.inter_op_num_threads = 1
     options.log_severity_level = 3
-    if 'CUDAExecutionProvider' in ort.get_available_providers():
-      if debug:
-        print("ONNX Runtime is using GPU")
-      provider = ('CUDAExecutionProvider', {'cudnn_conv_algo_search': 'DEFAULT'})
-    else:
-      if debug:
-        print("ONNX Runtime is using CPU")
-      provider = 'CPUExecutionProvider'
+    provider = 'CPUExecutionProvider'
 
     with open(model_path, "rb") as f:
       self.ort_session = ort.InferenceSession(f.read(), options, [provider])
@@ -100,10 +99,12 @@ class TinyPhysicsSimulator:
 
   def reset(self) -> None:
     self.step_idx = CONTEXT_LENGTH
-    self.state_history = [self.get_state_target(i)[0] for i in range(self.step_idx)]
+    state_targetfutures = [self.get_state_targetfuture(i) for i in range(self.step_idx)]
+    self.state_history = [x['state'] for x in state_targetfutures]
     self.action_history = self.data['steer_command'].values[:self.step_idx].tolist()
-    self.current_lataccel_history = [self.get_state_target(i)[1] for i in range(self.step_idx)]
-    self.target_lataccel_history = [self.get_state_target(i)[1] for i in range(self.step_idx)]
+    self.current_lataccel_history = [x['targetfuture'][0] for x in state_targetfutures]
+    self.target_lataccel_history = [x['targetfuture'][0] for x in state_targetfutures]
+    self.target_future = None
     self.current_lataccel = self.current_lataccel_history[-1]
     seed = int(md5(self.data_path.encode()).hexdigest(), 16) % 10**4
     np.random.seed(seed)
@@ -129,26 +130,29 @@ class TinyPhysicsSimulator:
     if step_idx >= CONTROL_START_IDX:
       self.current_lataccel = pred
     else:
-      self.current_lataccel = self.get_state_target(step_idx)[1]
+      self.current_lataccel = self.get_state_targetfuture(step_idx)['targetfuture'][0]
 
     self.current_lataccel_history.append(self.current_lataccel)
 
   def control_step(self, step_idx: int) -> None:
-    if step_idx >= CONTROL_START_IDX:
-      action = self.controller.update(self.target_lataccel_history[step_idx], self.current_lataccel, self.state_history[step_idx])
-    else:
+    action = self.controller.update(self.target_lataccel_history[step_idx], self.current_lataccel, self.state_history[step_idx], target_future=self.target_future)
+    if step_idx < CONTROL_START_IDX:
       action = self.data['steer_command'].values[step_idx]
     action = np.clip(action, STEER_RANGE[0], STEER_RANGE[1])
     self.action_history.append(action)
 
-  def get_state_target(self, step_idx: int) -> Tuple[State, float]:
+  def get_state_targetfuture(self, step_idx: int) -> Tuple[State, float]:
     state = self.data.iloc[step_idx]
-    return State(roll_lataccel=state['roll_lataccel'], v_ego=state['v_ego'], a_ego=state['a_ego']), state['target_lataccel']
+    return {
+      'state': State(roll_lataccel=state['roll_lataccel'], v_ego=state['v_ego'], a_ego=state['a_ego']),
+      'targetfuture': self.data['target_lataccel'].values[step_idx:step_idx + FUTURE_PLAN_STEPS].tolist()
+    }
 
   def step(self) -> None:
-    state, target = self.get_state_target(self.step_idx)
-    self.state_history.append(state)
-    self.target_lataccel_history.append(target)
+    state_targetfuture = self.get_state_targetfuture(self.step_idx)
+    self.state_history.append(state_targetfuture['state'])
+    self.target_lataccel_history.append(state_targetfuture['targetfuture'][0])
+    self.target_future = state_targetfuture['targetfuture'][1:]
     self.control_step(self.step_idx)
     self.sim_step(self.step_idx)
     self.step_idx += 1
@@ -164,8 +168,8 @@ class TinyPhysicsSimulator:
     ax.set_ylabel(axis_labels[1])
 
   def compute_cost(self) -> dict:
-    target = np.array(self.target_lataccel_history)[CONTROL_START_IDX:]
-    pred = np.array(self.current_lataccel_history)[CONTROL_START_IDX:]
+    target = np.array(self.target_lataccel_history)[CONTROL_START_IDX:COST_END_IDX]
+    pred = np.array(self.current_lataccel_history)[CONTROL_START_IDX:COST_END_IDX]
 
     lat_accel_cost = np.mean((target - pred)**2) * 100
     jerk_cost = np.mean((np.diff(pred) / DEL_T)**2) * 100
@@ -193,31 +197,36 @@ class TinyPhysicsSimulator:
     return self.compute_cost()
 
 
+def get_available_controllers():
+  return [f.stem for f in Path('controllers').iterdir() if f.is_file() and f.suffix == '.py' and f.stem != '__init__']
+
+
+def run_rollout(data_path, controller_type, model_path, debug=False):
+  tinyphysicsmodel = TinyPhysicsModel(model_path, debug=debug)
+  controller = importlib.import_module(f'controllers.{controller_type}').Controller()
+  sim = TinyPhysicsSimulator(tinyphysicsmodel, str(data_path), controller=controller, debug=debug)
+  return sim.rollout(), sim.target_lataccel_history, sim.current_lataccel_history
+
+
 if __name__ == "__main__":
+  available_controllers = get_available_controllers()
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_path", type=str, required=True)
   parser.add_argument("--data_path", type=str, required=True)
   parser.add_argument("--num_segs", type=int, default=100)
   parser.add_argument("--debug", action='store_true')
-  parser.add_argument("--controller", default='simple', choices=CONTROLLERS.keys())
+  parser.add_argument("--controller", default='simple', choices=available_controllers)
   args = parser.parse_args()
-
-  tinyphysicsmodel = TinyPhysicsModel(args.model_path, debug=args.debug)
 
   data_path = Path(args.data_path)
   if data_path.is_file():
-    controller = CONTROLLERS[args.controller]()
-    sim = TinyPhysicsSimulator(tinyphysicsmodel, args.data_path, controller=controller, debug=args.debug)
-    costs = sim.rollout()
-    print(f"\nAverage lataccel_cost: {costs['lataccel_cost']:>6.4}, average jerk_cost: {costs['jerk_cost']:>6.4}, average total_cost: {costs['total_cost']:>6.4}")
+    cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug)
+    print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
   elif data_path.is_dir():
-    costs = []
+    run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
     files = sorted(data_path.iterdir())[:args.num_segs]
-    for data_file in tqdm(files, total=len(files)):
-      controller = CONTROLLERS[args.controller]()
-      sim = TinyPhysicsSimulator(tinyphysicsmodel, str(data_file), controller=controller, debug=args.debug)
-      cost = sim.rollout()
-      costs.append(cost)
+    results = process_map(run_rollout_partial, files, max_workers=16)
+    costs = [result[0] for result in results]
     costs_df = pd.DataFrame(costs)
     print(f"\nAverage lataccel_cost: {np.mean(costs_df['lataccel_cost']):>6.4}, average jerk_cost: {np.mean(costs_df['jerk_cost']):>6.4}, average total_cost: {np.mean(costs_df['total_cost']):>6.4}")
     for cost in costs_df.columns:
