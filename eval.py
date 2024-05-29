@@ -73,7 +73,7 @@ if __name__ == "__main__":
   parser.add_argument("--test_controller", default='simple', choices=available_controllers)
   parser.add_argument("--baseline_controller", default='simple', choices=available_controllers)
   args = parser.parse_args()
-
+    
   data_path = Path(args.data_path)
   assert data_path.is_dir(), "data_path should be a directory"
 
@@ -98,8 +98,13 @@ if __name__ == "__main__":
 
   for controller_cat, controller_type in [('baseline', args.baseline_controller), ('test', args.test_controller)]:
     print(f"Running batch rollouts => {controller_cat} controller: {controller_type}")
-    rollout_partial = partial(run_rollout, controller_type=controller_type, model_path=args.model_path, debug=False)
-    results = process_map(rollout_partial, files[SAMPLE_ROLLOUTS:], max_workers=16)
-    costs += [{'controller': controller_cat, **result[0]} for result in results]
+    if controller_cat == 'baseline':
+        rollout_partial = partial(run_rollout, controller_type=controller_type, model_path=args.model_path, debug=False)
+        results = process_map(rollout_partial, files[SAMPLE_ROLLOUTS:], max_workers=16)
+        costs += [{'controller': controller_cat, **result[0]} for result in results]
+    else:
+        for data_path in tqdm(files[SAMPLE_ROLLOUTS:], total=len(files[SAMPLE_ROLLOUTS:])):
+            cost = run_rollout(data_path, controller_type=controller_type, model_path=args.model_path, debug=False)
+            costs += [{'controller': controller_cat, **cost[0]}]
 
   create_report(args.test_controller, args.baseline_controller, sample_rollouts, costs)
