@@ -11,6 +11,7 @@ from matplotlib import pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
+import torch
 
 from tinyphysics import CONTROL_START_IDX, get_available_controllers, run_rollout
 
@@ -65,6 +66,7 @@ def create_report(test, baseline, sample_rollouts, costs):
 
 
 if __name__ == "__main__":
+  torch.multiprocessing.set_start_method('spawn')
   available_controllers = get_available_controllers()
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_path", type=str, required=True)
@@ -98,13 +100,8 @@ if __name__ == "__main__":
 
   for controller_cat, controller_type in [('baseline', args.baseline_controller), ('test', args.test_controller)]:
     print(f"Running batch rollouts => {controller_cat} controller: {controller_type}")
-    if controller_cat == 'baseline':
-        rollout_partial = partial(run_rollout, controller_type=controller_type, model_path=args.model_path, debug=False)
-        results = process_map(rollout_partial, files[SAMPLE_ROLLOUTS:], max_workers=16)
-        costs += [{'controller': controller_cat, **result[0]} for result in results]
-    else:
-        for data_path in tqdm(files[SAMPLE_ROLLOUTS:], total=len(files[SAMPLE_ROLLOUTS:])):
-            cost = run_rollout(data_path, controller_type=controller_type, model_path=args.model_path, debug=False)
-            costs += [{'controller': controller_cat, **cost[0]}]
+    rollout_partial = partial(run_rollout, controller_type=controller_type, model_path=args.model_path, debug=False)
+    results = process_map(rollout_partial, files[SAMPLE_ROLLOUTS:], max_workers=16)
+    costs += [{'controller': controller_cat, **result[0]} for result in results]
 
   create_report(args.test_controller, args.baseline_controller, sample_rollouts, costs)
