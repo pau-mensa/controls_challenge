@@ -4,6 +4,7 @@ from . import BaseController
 import os
 import gymnasium as gym
 import numpy as np
+from collections import namedtuple
 from gymnasium import spaces
 import random
 from sb3_contrib import TRPO, RecurrentPPO
@@ -15,7 +16,6 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 import random
-from collections import namedtuple
 import pickle
 
 State = namedtuple('State', ['roll_lataccel', 'v_ego', 'a_ego'])
@@ -159,7 +159,7 @@ class Controller(BaseController):
     eval_env = DriverEnv()
     log_dir = "/notebooks/comma/tmp/"
     #log_dir = "/notebooks/comma/controls_challenge/tmp/"
-    stats_path = os.path.join(log_dir, "FinalRecurrentPPO_Steering_vec_normalize.pkl")
+    stats_path = os.path.join(log_dir, "TempFinalRecurrentPPO3_Steering_vec_normalize.pkl")
     #stats_path = os.path.join(log_dir, "model_checkpoints/rl_model_vecnormalize_950000_steps.pkl")
     eval_env = make_vec_env(lambda: eval_env, n_envs=1)
     eval_env = VecNormalize.load(stats_path, eval_env)
@@ -176,7 +176,7 @@ class Controller(BaseController):
 
     # Load the agent
     #self.model = RecurrentPPO.load(log_dir + "model_checkpoints/rl_model_950000_steps", env=eval_env, seed=42)
-    self.model = RecurrentPPO.load(log_dir + "FinalRecurrentPPO_Steering", env=eval_env, seed=42)
+    self.model = RecurrentPPO.load(log_dir + "TempFinalRecurrentPPO3_Steering", env=eval_env, seed=42)
     self.model.policy.normalize_images = False
     self.env = eval_env
     self.reset_env = True
@@ -185,22 +185,63 @@ class Controller(BaseController):
     self.actions = []
     
     
-  def update(self, target_lataccel, current_lataccel, state, target_future):
+  def exponential_moving_average(self, data, span):
+    """
+    Calculate the Exponential Moving Average (EMA) of a given data array.
+
+    Parameters:
+    data (array-like): The input array containing the data points.
+    span (int): The span for the EMA.
+
+    Returns:
+    np.array: The EMA of the data.
+    """
+    if not isinstance(data, (list, np.ndarray)):
+        raise ValueError("data should be a list or numpy array")
+    
+    if not isinstance(span, int) or span <= 0:
+        raise ValueError("span should be a positive integer")
+
+    data = np.asarray(data)
+    ema = np.zeros_like(data, dtype=float)
+    alpha = 2 / (span + 1)
+    
+    # The first EMA value is the same as the first data point
+    ema[0] = data[0]
+    
+    # Compute the EMA for each subsequent data point
+    for i in range(1, len(data)):
+        ema[i] = alpha * data[i] + (1 - alpha) * ema[i - 1]
+    
+    return ema
+    
+    
+  def update_array(self, array, newVal, limit=20):
+    array.append(newVal)
+    if len(array) > limit:
+      array = array[1:]
+    return array
+    
+    
+  def update(self, target_lataccel, current_lataccel, state, future_plan):
     if self.reset_env:
-      self.update_options({'target_lataccel': target_lataccel, 'current_lataccel': current_lataccel, 'state': state, 'targetfuture': target_future})
+      self.update_options({'target_lataccel': target_lataccel, 'current_lataccel': current_lataccel, 'state': state, 'targetfuture': future_plan[2]})
       self.observation = self.env.reset()
       self.observation = self.observation[0]
       self.reset_env = False
       self.n_updates += 1
+      self.actions.append((target_lataccel - current_lataccel) * 0.3)
       return (target_lataccel - current_lataccel) * 0.3
     else:
       self.n_updates += 1
-      self.update_options({'target_lataccel': target_lataccel, 'current_lataccel': current_lataccel, 'state': state, 'targetfuture': target_future})
+      self.update_options({'target_lataccel': target_lataccel, 'current_lataccel': current_lataccel, 'state': state, 'targetfuture': future_plan[2]})
       action, self.lstm_states = self.model.predict(self.observation, state=self.lstm_states, episode_start=self.episode_starts, deterministic=True)
       self.observation, _, dones, _ = self.env.step([[action[0]*2]])
       self.observation = self.observation[0]
-      self.episode_starts = dones        
-      self.actions.append(action[0]*2)
+      self.episode_starts = dones
+      self.actions = self.update_array(self.actions, action[0]*2, 3)
+      act = self.exponential_moving_average(self.actions, 3)[-1]
+      print(act, action[0]*2)
       return action[0]*2
     
   def update_options(self, options):
