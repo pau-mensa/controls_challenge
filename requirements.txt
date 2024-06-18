@@ -11,3 +11,4 @@ torchaudio==2.2.2
 stable-baselines3
 sb3-contrib
 wandb
+bayesian-optimization==1.4.0
