@@ -100,6 +100,7 @@ def create_report(test, baseline, sample_rollouts, costs, num_segs):
 
 
 if __name__ == "__main__":
+  # Needed for multiprocessing if the controller is based on pytorch.
   torch.multiprocessing.set_start_method('spawn')
   available_controllers = get_available_controllers()
   parser = argparse.ArgumentParser()
