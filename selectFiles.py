@@ -26,7 +26,7 @@ def compare_distributions(hist1, hist2):
     return np.mean(distances)
 
 
-def select_top_n_files(data_path, n_files, subset, bins=50):
+def select_top_n_files(data_path, n_files, subset, bins):
     """Select top n files representing the distribution of all files."""
     all_files = sorted([os.path.join(data_path, f) for f in os.listdir(data_path) if f.endswith('.csv')])[:subset]
     overall_data = pd.concat([pd.read_csv(file) for file in tqdm(all_files, desc="Loading files")], ignore_index=True)
@@ -43,6 +43,18 @@ def select_top_n_files(data_path, n_files, subset, bins=50):
     
     # Sort files by score (lower score means closer distribution) and select top n
     top_n_files = sorted(file_scores, key=lambda x: x[1])[:n_files]
+    
+    dfs = []
+    for file, _ in tqdm(top_n_files, desc='Scoring selection'):
+        data = pd.read_csv(file)
+        data = data.drop(columns=['t', 'steerCommand'])
+        dfs.append(data)
+    final_df = pd.concat(dfs)
+    final_hist = compute_column_distribution(final_df, bins=bins)
+    final_score = compare_distributions(overall_hist, final_hist)
+    
+    print(f'The final distance of the selected files and the overall distribution is: {final_score}')
+    
     return [file for file, score in top_n_files]
 
 
@@ -61,7 +73,7 @@ if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--n_files", type=int, required=True)
-    parser.add_argument("--subset", type=int, default=5000)
+    parser.add_argument("--subset", type=int, default=20_000)
     parser.add_argument("--bins", default='fd')
     parser.add_argument("--file_out", type=str, default='out')
     args = parser.parse_args()
